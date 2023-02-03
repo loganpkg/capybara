@@ -1,0 +1,499 @@
+#!/bin/sh
+
+#
+# Copyright (c) 2021, 2023 Logan Ryan McLintock
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+
+# capybara -- file system versioning.
+# Code based off my code from sloth [version control system]
+# (see sloth branch here: https://www.spottexteditor.com).
+
+# set -x
+set -e
+set -u
+
+# SQLite3 settings
+dot_settings='/* .echo on */
+/* .changes on */
+.bail on
+.binary on
+.mode ascii
+.separator "|" "\n"
+.headers off
+.nullvalue NULL'
+
+
+usage='Usage:
+Unless otherwise stated, all commands need to be run from the source directory:
+capybara help
+    Print this usage information.
+capybara init store_dir
+    Sets up the store directory and creates the .capybara_store_location file.
+capybara snapshot
+    Snapshots the current directory.
+capybara vacuum
+    Removes unreferenced data.
+capybara verify
+    Checks the data hashes.
+capybara log
+    Lists the snapshots.
+capybara checkout snapshot
+    Recreates snapshot in the checkout subdirectory of the store directory
+    using hard links to the data. Do not edit a checkout or it will corrupt
+    the store. Copy what you need elsewhere (preserving metadata).
+    This can be run from the source directory or the store directory
+    (to allow recovery if the source directory disk fails).
+'
+
+if [ "$#" -lt 1 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+os="$(uname)"
+
+if [ "$os" = Linux ]
+then
+    stat_option='-c'
+    stat_format='%n|%s|%Y|%a'
+    stat_size_format='%s'
+    sha512=sha512sum
+    sha512_make="$sha512"' --tag'
+else
+    # BSD
+    stat_option='-f'
+    stat_format='%N|%z|%m|%Lp'
+    stat_size_format='%z'
+    sha512=sha512
+    sha512_make="$sha512"
+fi
+
+
+###############################################################################
+if [ "$1" = init ]
+then
+
+if [ "$#" -ne 2 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$2"
+
+if [ -e "$store_dir" ] || [ -e .capybara_store_location ]
+then
+    printf 'Error: capybara store already exists\n' 1>&2
+    exit 1
+fi
+
+printf '%s\n' "$store_dir" > .capybara_store_location
+
+mkdir -p "$store_dir"/data
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+BEGIN TRANSACTION;
+
+CREATE TABLE c_snapshot
+(snapshot_time INTEGER NOT NULL CHECK (snapshot_time > 0) UNIQUE PRIMARY KEY
+);
+
+CREATE TABLE c_data
+(hash TEXT NOT NULL CHECK (Length(hash) = 128) UNIQUE PRIMARY KEY
+);
+
+CREATE TABLE c_file
+(snapshot_time INTEGER NOT NULL CHECK (snapshot_time > 0),
+filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%'),
+file_size INTEGER NOT NULL CHECK (file_size >= 0),
+modified_time INTEGER NOT NULL CHECK (modified_time > 0),
+perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777),
+hash TEXT NOT NULL CHECK (Length(hash) = 128)
+);
+
+CREATE INDEX idx_c_file_st ON c_file(snapshot_time);
+CREATE INDEX idx_c_file_hash ON c_file(hash);
+
+CREATE TABLE c_latest
+(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
+file_size INTEGER NOT NULL CHECK (file_size >= 0),
+modified_time INTEGER NOT NULL CHECK (modified_time > 0),
+perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777),
+hash TEXT NOT NULL CHECK (Length(hash) = 128)
+);
+
+CREATE INDEX idx_c_latest_fn_fs_mt
+    ON c_latest(filename, file_size, modified_time);
+
+CREATE INDEX idx_c_latest_hash ON c_latest(hash);
+
+CREATE TABLE c_stage
+(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
+file_size INTEGER NOT NULL CHECK (file_size >= 0),
+modified_time INTEGER NOT NULL CHECK (modified_time > 0),
+perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777)
+);
+
+CREATE INDEX idx_c_stage_fn_fs_mt
+    ON c_stage(filename, file_size, modified_time);
+
+
+CREATE TABLE c_hash_result
+(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
+hash TEXT NOT NULL CHECK (Length(hash) = 128)
+);
+
+CREATE INDEX idx_c_hash_result_hash ON c_hash_result(hash);
+
+END TRANSACTION;
+
+.quit
+EOF
+
+
+###############################################################################
+elif [ "$1" = snapshot ]
+then
+
+if [ "$#" -ne 1 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$(cat .capybara_store_location)"
+
+snapshot_time="$(date '+%s')"
+
+tmp_stat="$(mktemp)"
+tmp_to_hash="$(mktemp)"
+tmp_hash_result="$(mktemp)"
+
+find . -type f -exec stat "$stat_option" "$stat_format" '{}' \; \
+    | cut -c 3- > "$tmp_stat"
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+DELETE FROM c_stage;
+.import $tmp_stat c_stage
+
+DELETE FROM c_latest;
+
+INSERT INTO c_latest
+(filename,
+file_size,
+modified_time,
+perm,
+hash)
+SELECT
+a.filename,
+a.file_size,
+a.modified_time,
+a.perm,
+a.hash
+FROM c_file AS a
+WHERE
+a.snapshot_time = (SELECT Max(b.snapshot_time) FROM c_snapshot AS b);
+
+.echo off
+.changes off
+.output $tmp_to_hash
+
+/* Files to hash */
+SELECT
+a.filename
+FROM c_stage AS a
+WHERE
+(a.filename, a.file_size, a.modified_time)
+NOT IN
+(SELECT b.filename, b.file_size, b.modified_time FROM c_latest AS b);
+
+.output
+
+.quit
+EOF
+
+if [ -s "$tmp_to_hash" ]
+then
+< "$tmp_to_hash" tr '\n' '\0' | xargs -0 -n 100 -P 1 $sha512_make \
+    | sed -E 's/^SHA512 \((.*)\) = /\1|/' > "$tmp_hash_result"
+fi
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+DELETE FROM c_hash_result;
+.import $tmp_hash_result c_hash_result
+
+.quit
+EOF
+
+
+while IFS='|' read -r filename hash
+do
+    hash_subdir=$(printf '%s' "$hash" | cut -c -2)
+    target_dir="$store_dir"/data/"$hash_subdir"
+    mkdir -p "$target_dir"
+    cp "$filename" "$target_dir"/"$hash"
+done < "$tmp_hash_result"
+
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+BEGIN TRANSACTION;
+
+INSERT INTO c_snapshot (snapshot_time) VALUES ($snapshot_time);
+
+INSERT INTO c_data (hash) SELECT hash FROM c_hash_result;
+
+INSERT INTO c_file
+(
+snapshot_time,
+filename,
+file_size,
+modified_time,
+perm,
+hash
+)
+SELECT
+$snapshot_time,
+a.filename,
+a.file_size,
+a.modified_time,
+a.perm,
+Coalesce(b.hash, c.hash) AS hash
+FROM c_stage AS a
+LEFT JOIN c_latest as b
+ON a.filename = b.filename
+AND a.file_size = b.file_size
+AND a.modified_time = b.modified_time
+LEFT JOIN c_hash_result as c
+ON a.filename = c.filename;
+
+END TRANSACTION;
+
+.quit
+EOF
+
+rm "$tmp_stat" "$tmp_to_hash" "$tmp_hash_result"
+
+
+###############################################################################
+elif [ "$1" = vacuum ]
+then
+
+if [ "$#" -ne 1 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$(cat .capybara_store_location)"
+
+tmp_to_keep="$(mktemp)"
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+BEGIN TRANSACTION;
+
+DELETE FROM c_data AS a
+WHERE
+a.hash NOT IN
+(SELECT b.hash FROM c_file AS b GROUP BY b.hash);
+
+DELETE FROM c_file AS a
+WHERE
+a.hash NOT IN
+(SELECT b.hash FROM c_data AS b);
+
+END TRANSACTION;
+
+.echo off
+.changes off
+.output $tmp_to_keep
+SELECT hash FROM c_data;
+.output
+
+.quit
+EOF
+
+
+while IFS='|' read -r hash
+do
+    hash_subdir=$(printf '%s' "$hash" | cut -c -2)
+    new_dir="$store_dir"/data2/"$hash_subdir"
+    mkdir -p "$new_dir"
+    ln "$store_dir"/data/"$hash_subdir"/"$hash" "$new_dir"/"$hash"
+done < "$tmp_to_keep"
+
+
+rm -rf "$store_dir"/data
+mv "$store_dir"/data2 "$store_dir"/data
+
+rm "$tmp_to_keep"
+
+
+###############################################################################
+elif [ "$1" = verify ]
+then
+
+if [ "$#" -ne 1 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$(cat .capybara_store_location)"
+
+tmp_hash_to_check="$(mktemp)"
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+.echo off
+.changes off
+.output $tmp_hash_to_check
+SELECT
+'SHA512 (' || Substr(hash, 1, 2) || '/' || hash || ') = ' || hash
+FROM c_data;
+.output
+
+.quit
+EOF
+
+cd "$store_dir"/data
+
+"$sha512" -c "$tmp_hash_to_check"
+
+rm "$tmp_hash_to_check"
+
+
+###############################################################################
+elif [ "$1" = log ]
+then
+
+if [ "$#" -ne 1 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$(cat .capybara_store_location)"
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+SELECT
+snapshot_time,
+Datetime(snapshot_time, 'unixepoch', 'localtime')
+FROM c_snapshot
+ORDER BY
+snapshot_time DESC;
+
+.quit
+EOF
+
+
+###############################################################################
+elif [ "$1" = checkout ]
+then
+
+if [ "$#" -ne 2 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+snapshot="$2"
+
+if [ -e .capybara_store_location ]
+then
+store_dir="$(cat .capybara_store_location)"
+elif [ -e .capybara.db ]
+then
+store_dir='.'
+fi
+
+tmp_checkout="$(mktemp)"
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+.echo off
+.changes off
+.output $tmp_checkout
+
+SELECT
+filename,
+file_size,
+modified_time,
+perm,
+hash
+FROM c_file
+WHERE
+snapshot_time = $snapshot;
+
+.output
+
+.quit
+EOF
+
+rm -rf "$store_dir"/checkout
+
+
+while IFS='|' read -r filename file_size modified_time perm hash
+do
+    fn_dir=$(dirname "$filename")
+    mkdir -p "$store_dir"/checkout/"$fn_dir"
+    target_path="$store_dir"/checkout/"$filename"
+    hash_subdir=$(printf '%s' "$hash" | cut -c -2)
+    hash_path="$store_dir"/data/"$hash_subdir"/"$hash"
+    ln "$hash_path" "$target_path"
+    hash_fs=$(stat "$stat_option" "$stat_size_format" "$hash_path")
+    if [ "$file_size" -ne "$hash_fs" ]
+    then
+        printf 'Error: %s: File size mismatch upon checkout of file: %s\n' \
+            "$1" "$filename" 1>&2
+        exit 1
+    fi
+    touch -d @"$modified_time" "$target_path"
+    chmod "$perm" "$target_path"
+done < "$tmp_checkout"
+
+
+rm "$tmp_checkout"
+
+
+###############################################################################
+elif [ "$1" = help ]
+then
+    printf '%s' "$usage"
+
+
+###############################################################################
+else
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
