@@ -491,7 +491,13 @@ do
             "$1" "$filename" 1>&2
         exit 1
     fi
-    touch -d @"$modified_time" "$target_path"
+    if [ "$os" = Linux ]
+    then
+        touch -d @"$modified_time" "$target_path"
+    else
+        dttm=$(date '+%Y-%m-%dT%H:%M:%S' -r "$modified_time")
+        touch -d "$dttm"
+    fi
     chmod "$perm" "$target_path"
 done < "$tmp_checkout"
 
