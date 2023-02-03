@@ -187,6 +187,7 @@ snapshot_time="$(date '+%s')"
 tmp_stat="$(mktemp)"
 tmp_to_hash="$(mktemp)"
 tmp_hash_result="$(mktemp)"
+tmp_to_copy="$(mktemp)"
 
 find . -type f -exec stat "$stat_option" "$stat_format" '{}' \; \
     | cut -c 3- > "$tmp_stat"
@@ -245,6 +246,18 @@ $dot_settings
 DELETE FROM c_hash_result;
 .import $tmp_hash_result c_hash_result
 
+.echo off
+.changes off
+.output $tmp_to_copy
+
+SELECT
+Min(filename),
+hash
+FROM c_hash_result
+GROUP BY hash;
+
+.output
+
 .quit
 EOF
 
@@ -254,8 +267,8 @@ do
     hash_subdir=$(printf '%s' "$hash" | cut -c -2)
     target_dir="$store_dir"/data/"$hash_subdir"
     mkdir -p "$target_dir"
-    cp "$filename" "$target_dir"/"$hash"
-done < "$tmp_hash_result"
+    cp -i "$filename" "$target_dir"/"$hash"
+done < "$tmp_to_copy"
 
 
 sqlite3 "$store_dir"/.capybara.db <<EOF
@@ -265,7 +278,7 @@ BEGIN TRANSACTION;
 
 INSERT INTO c_snapshot (snapshot_time) VALUES ($snapshot_time);
 
-INSERT INTO c_data (hash) SELECT hash FROM c_hash_result;
+INSERT INTO c_data (hash) SELECT hash FROM c_hash_result GROUP BY hash;
 
 INSERT INTO c_file
 (
@@ -296,7 +309,7 @@ END TRANSACTION;
 .quit
 EOF
 
-rm "$tmp_stat" "$tmp_to_hash" "$tmp_hash_result"
+rm "$tmp_stat" "$tmp_to_hash" "$tmp_hash_result" "$tmp_to_copy"
 
 
 ###############################################################################
