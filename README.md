@@ -33,6 +33,8 @@ capybara help
     Print this usage information.
 capybara init store_dir
     Sets up the store directory and creates the .capybara_store_location file.
+capybara status
+    Gives a summary of file changes since the last snapshot.
 capybara snapshot
     Snapshots the current directory.
 capybara vacuum
