@@ -41,6 +41,8 @@ capybara help
     Print this usage information.
 capybara init store_dir
     Sets up the store directory and creates the .capybara_store_location file.
+capybara status
+    Gives a summary of file changes since the last snapshot.
 capybara snapshot
     Snapshots the current directory.
 capybara vacuum
@@ -495,8 +497,9 @@ do
     then
         touch -d @"$modified_time" "$target_path"
     else
-        dttm=$(date '+%Y-%m-%dT%H:%M:%S' -r "$modified_time")
-        touch -d "$dttm"
+        # '+%Y-%m-%dT%H:%M:%S'
+        dttm=$(TZ=UTC date -Iseconds -r "$modified_time")
+        touch -d "$dttm" "$target_path"
     fi
     chmod "$perm" "$target_path"
 done < "$tmp_checkout"
