@@ -65,14 +65,12 @@ if [ "$os" = Linux ]
 then
     stat_option='-c'
     stat_format='%n|%s|%Y|%a'
-    sha512=sha512sum
-    sha512_make="$sha512"' --tag'
+    sha512_make='sha512sum --tag'
 else
     # BSD
     stat_option='-f'
     stat_format='%N|%z|%m|%Lp'
-    sha512=sha512
-    sha512_make="$sha512"
+    sha512_make=sha512
 fi
 
 
@@ -476,7 +474,7 @@ EOF
 
 cd "$store_dir"/data
 
-"$sha512" -c "$tmp_hash_to_check"
+sha512sum -c "$tmp_hash_to_check"
 
 rm "$tmp_hash_to_check"
 
