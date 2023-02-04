@@ -497,9 +497,8 @@ do
     then
         touch -d @"$modified_time" "$target_path"
     else
-        # '+%Y-%m-%dT%H:%M:%S'
-        dttm=$(TZ=UTC date -Iseconds -r "$modified_time")
-        touch -d "$dttm" "$target_path"
+        dttm=$(TZ=UTC date -r "$modified_time" '+%Y-%m-%dT%H:%M:%S')
+        TZ=UTC touch -d "$dttm" "$target_path"
     fi
     chmod "$perm" "$target_path"
 done < "$tmp_checkout"
