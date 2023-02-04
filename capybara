@@ -65,14 +65,12 @@ if [ "$os" = Linux ]
 then
     stat_option='-c'
     stat_format='%n|%s|%Y|%a'
-    stat_size_format='%s'
     sha512=sha512sum
     sha512_make="$sha512"' --tag'
 else
     # BSD
     stat_option='-f'
     stat_format='%N|%z|%m|%Lp'
-    stat_size_format='%z'
     sha512=sha512
     sha512_make="$sha512"
 fi
@@ -540,7 +538,6 @@ $dot_settings
 
 SELECT
 filename,
-file_size,
 modified_time,
 perm,
 hash
@@ -556,21 +553,13 @@ EOF
 rm -rf "$store_dir"/checkout
 
 
-while IFS='|' read -r filename file_size modified_time perm hash
+while IFS='|' read -r filename modified_time perm hash
 do
     fn_dir=$(dirname "$filename")
     mkdir -p "$store_dir"/checkout/"$fn_dir"
     target_path="$store_dir"/checkout/"$filename"
     hash_subdir=$(printf '%s' "$hash" | cut -c -2)
-    hash_path="$store_dir"/data/"$hash_subdir"/"$hash"
-    ln "$hash_path" "$target_path"
-    hash_fs=$(stat "$stat_option" "$stat_size_format" "$hash_path")
-    if [ "$file_size" -ne "$hash_fs" ]
-    then
-        printf 'Error: %s: File size mismatch upon checkout of file: %s\n' \
-            "$1" "$filename" 1>&2
-        exit 1
-    fi
+    ln "$store_dir"/data/"$hash_subdir"/"$hash" "$target_path"
     if [ "$os" = Linux ]
     then
         touch -d @"$modified_time" "$target_path"
