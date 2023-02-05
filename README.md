@@ -47,6 +47,9 @@ capybara vacuum
     Removes unreferenced data.
 capybara verify
     Checks the data hashes.
+capybara merge_media capybara_source_subdir external_media_dir
+    Moves photos and videos from external_media_dir into capybara_source_subdir
+    and organised them by the exif create date stored inside the files.
 capybara log
     Lists the snapshots.
 capybara checkout snapshot
