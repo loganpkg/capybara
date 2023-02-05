@@ -22,6 +22,12 @@ capybara is file system versioning software. It imputes hashes when
 It does not use cascading layers of hard links, and so will work fine
 on file systems with hard link limits.
 
+A capybara store can be copied from one operating system to another.
+The `.capybara_store_location` in the source directory will need to
+be edited to represent the new store location. The `checkout` subdirectory
+in the store directory should be deleted before the copy, or the copy
+should preserve hard links.
+
 To install, simply place the `capybara` file somewhere in your `PATH`.
 You may need to give it executable permission too. It should run on any
 POSIX-like system with `sqlite3` installed, including WSL on Windows.
@@ -61,3 +67,6 @@ data and uses hard links to speedup checkouts, instead of copying the data.
 
 capybara does not store file ownership information, and so is only suitable
 when all of the files belong to the same owner.
+
+It only stores files, so empty directories and directory permissions are
+not preserved.
