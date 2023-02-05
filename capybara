@@ -665,8 +665,9 @@ tmp_media_dir=$(mktemp -d XXXXXXXXXX)
 
 while IFS='|' read -r filename hash
 do
-    fn_extension=$(printf '%s' "$filename" | sed -E 's/.*\.([^.]*)$/\1/')
-    ln "$filename" "$tmp_media_dir"/"$hash"."$fn_extension"
+    # To preserve the file extension
+    fn_base=$(basename "$filename")
+    ln "$filename" "$tmp_media_dir"/"$hash"_"$fn_base"
 done < "$tmp_to_hard_link"
 
 rm -rf "$external_media_dir"
@@ -689,6 +690,12 @@ find "$tmp_media_dir" \
 
 # Delete empty directories
 find "$tmp_media_dir" -type d -empty -delete
+
+if [ -d "$tmp_media_dir" ]
+then
+    printf 'capybara: Unorganised files remain in directory: %s\n' \
+        "$tmp_media_dir"
+fi
 
 rm "$tmp_status" "$tmp_to_hash" "$tmp_hash_result" "$tmp_to_hard_link"
 
