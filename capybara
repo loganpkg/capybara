@@ -17,8 +17,11 @@
 #
 
 # capybara -- file system versioning.
+#
 # Code based off my code from sloth [version control system]
 # (see sloth branch here: https://www.spottexteditor.com).
+# merge_media code based on my code from possum [picture and video organiser]
+# (see the possum branch of this repo).
 
 # set -x
 set -e
@@ -49,6 +52,9 @@ capybara vacuum
     Removes unreferenced data.
 capybara verify
     Checks the data hashes.
+capybara merge_media capybara_source_subdir external_media_dir
+    Moves photos and videos from external_media_dir into capybara_source_subdir
+    and organised them by the exif create date stored inside the files.
 capybara log
     Lists the snapshots.
 capybara checkout snapshot
@@ -74,19 +80,24 @@ else
 fi
 
 
-gather_metadata() {
+bad_filenames() {
 tmp_bad_fn="$(mktemp)"
-tmp_stat="$(mktemp)"
 
-find . -type f \( -name '*|*' -o -name '*
+find "$1" -type f \( -name '*|*' -o -name '*
 *' \) > "$tmp_bad_fn"
 
 if [ -s "$tmp_bad_fn" ]
 then
     printf 'Error: capybara: Newline or pipe character in filename(s):\n' 1>&2
     cat "$tmp_bad_fn" 1>&2
+    rm "$tmp_bad_fn"
     exit 1
 fi
+}
+
+
+gather_metadata() {
+tmp_stat="$(mktemp)"
 
 find . -type f -exec stat "$stat_option" "$stat_format" '{}' \; \
     | cut -c 3- > "$tmp_stat"
@@ -100,7 +111,7 @@ DELETE FROM c_stage;
 .quit
 EOF
 
-rm "$tmp_bad_fn" "$tmp_stat"
+rm "$tmp_stat"
 }
 
 
@@ -128,6 +139,15 @@ a.snapshot_time = (SELECT Max(b.snapshot_time) FROM c_snapshot AS b);
 
 .quit
 EOF
+}
+
+
+hash_files() {
+if [ -s "$1" ]
+then
+< "$1" tr '\n' '\0' | xargs -0 -n 100 -P 1 $sha512_make \
+    | sed -E 's/^SHA512 \((.*)\) = /\1|/' > "$2"
+fi
 }
 
 
@@ -238,6 +258,7 @@ fi
 
 store_dir="$(cat .capybara_store_location)"
 
+bad_filenames '.'
 gather_metadata
 load_latest
 
@@ -310,11 +331,7 @@ NOT IN
 EOF
 
 
-if [ -s "$tmp_to_hash" ]
-then
-< "$tmp_to_hash" tr '\n' '\0' | xargs -0 -n 100 -P 1 $sha512_make \
-    | sed -E 's/^SHA512 \((.*)\) = /\1|/' > "$tmp_hash_result"
-fi
+hash_files "$tmp_to_hash" "$tmp_hash_result"
 
 sqlite3 "$store_dir"/.capybara.db <<EOF
 $dot_settings
@@ -570,6 +587,110 @@ done < "$tmp_checkout"
 
 
 rm "$tmp_checkout"
+
+
+###############################################################################
+elif [ "$1" = merge_media ]
+then
+
+if [ "$#" -ne 3 ]
+then
+    printf 'Error: %s' "$usage" 1>&2
+    exit 1
+fi
+
+capybara_source_subdir=$(printf '%s' "$2" | sed -E 's|/+$||')
+external_media_dir="$3"
+
+store_dir="$(cat .capybara_store_location)"
+
+if [ ! -d "$external_media_dir" ]
+then
+    printf 'Error: capybara: Could not find external_media_dir: %s\n' \
+        "$external_media_dir" 1>&2
+    exit 1
+fi
+
+tmp_status="$(mktemp)"
+
+capybara status > "$tmp_status"
+
+if [ -s "$tmp_status" ]
+then
+    printf 'Error: capybara: Files have changed since last snapshot:\n' 1>&2
+    cat "$tmp_status" 1>&2
+    rm "$tmp_status"
+    exit 1
+fi
+
+tmp_to_hash="$(mktemp)"
+tmp_hash_result="$(mktemp)"
+tmp_to_hard_link="$(mktemp)"
+
+bad_filenames "$external_media_dir"
+
+find "$external_media_dir" -type f ! -empty > "$tmp_to_hash"
+
+hash_files "$tmp_to_hash" "$tmp_hash_result"
+
+load_latest
+
+
+sqlite3 "$store_dir"/.capybara.db <<EOF
+$dot_settings
+
+DELETE FROM c_hash_result;
+.import $tmp_hash_result c_hash_result
+
+.echo off
+.changes off
+.output $tmp_to_hard_link
+
+SELECT
+Min(a.filename),
+a.hash
+FROM c_hash_result AS a
+WHERE a.hash NOT IN
+    (SELECT b.hash FROM c_latest AS b
+    WHERE b.filename LIKE '$capybara_source_subdir/%'
+    GROUP BY b.hash)
+GROUP BY a.hash;
+
+.output
+
+.quit
+EOF
+
+tmp_media_dir=$(mktemp -d XXXXXXXXXX)
+
+while IFS='|' read -r filename hash
+do
+    fn_extension=$(printf '%s' "$filename" | sed -E 's/.*\.([^.]*)$/\1/')
+    ln "$filename" "$tmp_media_dir"/"$hash"."$fn_extension"
+done < "$tmp_to_hard_link"
+
+rm -rf "$external_media_dir"
+
+# Rename and move files with exif date
+exiftool -r '-FileName<CreateDate' \
+-d "$capybara_source_subdir"'/%Y/%m/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
+-ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$tmp_media_dir"
+
+# Rename and move files without exif date
+exiftool -r '-FileName<FileModifyDate' \
+-d "$capybara_source_subdir"'/noexifdate/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
+-ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$tmp_media_dir"
+
+# Delete junk and PNG files
+find "$tmp_media_dir" \
+\( -name 'desktop.ini' -o -name '.nomedia' -o -iname '*.AAE' \
+-o -iname '*.PNG' \) \
+-type f -delete
+
+# Delete empty directories
+find "$tmp_media_dir" -type d -empty -delete
+
+rm "$tmp_status" "$tmp_to_hash" "$tmp_hash_result" "$tmp_to_hard_link"
 
 
 ###############################################################################
