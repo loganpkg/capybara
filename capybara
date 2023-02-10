@@ -16,12 +16,22 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
 
+#
 # capybara -- file system versioning.
+#
+#
+# Jesus answered, "Those who drink this water will get thirsty again,
+# but those who drink the water that I will give them will never be thirsty
+# again. The water that I will give them will become in them a spring which
+# will provide them with life-giving water and give them eternal life."
+#                                                          John 4:13-14 GNT
+#
 #
 # Code based off my code from sloth [version control system]
 # (see sloth branch here: https://www.spottexteditor.com).
 # merge_media code based on my code from possum [picture and video organiser]
 # (see the possum branch of this repo).
+#
 
 # set -x
 set -e
