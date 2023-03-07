@@ -33,7 +33,7 @@
 # (see the possum branch of this repo).
 #
 
-# set -x
+set -x
 set -e
 set -u
 
@@ -54,10 +54,8 @@ capybara help
     Print this usage information.
 capybara init store_dir
     Sets up the store directory and creates the .capybara_store_location file.
-capybara status
-    Gives a summary of file changes since the last snapshot.
-capybara snapshot
-    Snapshots the current directory.
+capybara diff snapshot_old snapshot_new
+    Summarises the changes between two snapshots.
 capybara vacuum
     Removes unreferenced data.
 capybara verify
@@ -67,6 +65,8 @@ capybara merge_media capybara_source_subdir external_media_dir
     and organised them by the exif create date stored inside the files.
 capybara log
     Lists the snapshots.
+capybara clean_perms
+    Resets the permissions of stored files by looking at their content.
 capybara checkout snapshot
     Recreates snapshot in the checkout subdirectory of the store directory
     using hard links to the data. Do not edit a checkout or it will corrupt
@@ -75,95 +75,8 @@ capybara checkout snapshot
     (to allow recovery if the source directory disk fails).
 '
 
-os="$(uname)"
+# os="$(uname)"
 
-gather_metadata() {
-tmp_fn="$(mktemp)"
-tmp_fn_check="$(mktemp)"
-
-find . -type f -print0 > "$tmp_fn"
-
-< "$tmp_fn" tr -d '|\n' > "$tmp_fn_check"
-
-if ! cmp "$tmp_fn" "$tmp_fn_check"
-then
-    printf 'Error: capybara: Newline or pipe character in filename\n' 1>&2
-    rm "$tmp_fn" "$tmp_fn_check"
-    exit 1
-fi
-
-tmp_stat="$(mktemp)"
-
-if [ "$os" = Linux ]
-then
-    < "$tmp_fn" xargs -0 -n 100 -P 1 stat -c '%n|%s|%Y|%a' \
-        | sed -E 's|^\./||' > "$tmp_stat"
-else
-    # BSD
-    < "$tmp_fn" xargs -0 -n 100 -P 1 stat -f '%N|%z|%m|%Lp' \
-        | sed -E 's|^\./||' > "$tmp_stat"
-fi
-
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-DELETE FROM c_stage;
-.import $tmp_stat c_stage
-
-.quit
-EOF
-
-rm "$tmp_fn" "$tmp_fn_check" "$tmp_stat"
-}
-
-
-load_latest() {
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-DELETE FROM c_latest;
-
-INSERT INTO c_latest
-(filename,
-file_size,
-modified_time,
-perm,
-hash)
-SELECT
-a.filename,
-a.file_size,
-a.modified_time,
-a.perm,
-a.hash
-FROM c_file AS a
-WHERE
-a.snapshot_time = (SELECT Max(b.snapshot_time) FROM c_snapshot AS b);
-
-.quit
-EOF
-}
-
-
-hash_files() {
-if [ -s "$1" ]
-then
-    if [ "$os" = Linux ]
-    then
-        < "$1" tr '\n' '\0' | xargs -0 -n 100 -P 1 sha512sum --tag \
-            | sed -E 's/^SHA512 \((.*)\) = /\1|/' > "$2"
-    else
-        < "$1" tr '\n' '\0' | xargs -0 -n 100 -P 1 sha512 \
-            | sed -E 's/^SHA512 \((.*)\) = /\1|/' > "$2"
-    fi
-fi
-}
-
-
-if [ "$#" -lt 1 ]
-then
-    printf 'Error: %s' "$usage" 1>&2
-    exit 1
-fi
 
 
 ###############################################################################
@@ -172,7 +85,7 @@ then
 
 if [ "$#" -ne 2 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
@@ -180,125 +93,87 @@ store_dir="$2"
 
 if [ -e "$store_dir" ] || [ -e .capybara_store_location ]
 then
-    printf 'Error: capybara store already exists\n' 1>&2
+    printf '%s: Error: capybara store already exists\n' "$0" 1>&2
     exit 1
 fi
 
 printf '%s\n' "$store_dir" > .capybara_store_location
 
 mkdir -p "$store_dir"/data
+touch "$store_dir"/.capybara_store
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-BEGIN TRANSACTION;
-
-CREATE TABLE c_snapshot
-(snapshot_time INTEGER NOT NULL CHECK (snapshot_time > 0) UNIQUE PRIMARY KEY
-);
-
-CREATE TABLE c_data
-(hash TEXT NOT NULL CHECK (Length(hash) = 128) UNIQUE PRIMARY KEY
-);
-
-CREATE TABLE c_file
-(snapshot_time INTEGER NOT NULL CHECK (snapshot_time > 0),
-filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
-    AND filename NOT LIKE '%' || x'0A' || '%'),
-file_size INTEGER NOT NULL CHECK (file_size >= 0),
-modified_time INTEGER NOT NULL CHECK (modified_time > 0),
-perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777),
-hash TEXT NOT NULL CHECK (Length(hash) = 128)
-);
-
-CREATE INDEX idx_c_file_st ON c_file(snapshot_time);
-CREATE INDEX idx_c_file_hash ON c_file(hash);
-
-CREATE TABLE c_latest
-(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
-    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
-file_size INTEGER NOT NULL CHECK (file_size >= 0),
-modified_time INTEGER NOT NULL CHECK (modified_time > 0),
-perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777),
-hash TEXT NOT NULL CHECK (Length(hash) = 128)
-);
-
-CREATE INDEX idx_c_latest_fn_fs_mt
-    ON c_latest(filename, file_size, modified_time);
-
-CREATE INDEX idx_c_latest_hash ON c_latest(hash);
-
-CREATE TABLE c_stage
-(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
-    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
-file_size INTEGER NOT NULL CHECK (file_size >= 0),
-modified_time INTEGER NOT NULL CHECK (modified_time > 0),
-perm INTEGER NOT NULL CHECK (perm >= 0 AND perm <= 777)
-);
-
-CREATE INDEX idx_c_stage_fn_fs_mt
-    ON c_stage(filename, file_size, modified_time);
-
-
-CREATE TABLE c_hash_result
-(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
-    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
-hash TEXT NOT NULL CHECK (Length(hash) = 128)
-);
-
-CREATE INDEX idx_c_hash_result_hash ON c_hash_result(hash);
-
-CREATE TABLE c_to_copy
-(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
-    AND filename NOT LIKE '%' || x'0A' || '%'),
-hash TEXT NOT NULL CHECK (Length(hash) = 128) UNIQUE PRIMARY KEY
-);
-
-CREATE UNIQUE INDEX uidx_c_to_copy_fn ON c_to_copy(filename);
-
-
-END TRANSACTION;
-
-.quit
-EOF
+mkdir -p "$store_dir"/snapshot
 
 
 ###############################################################################
-elif [ "$1" = status ]
+elif [ "$1" = diff ]
 then
 
-if [ "$#" -ne 1 ]
+if [ "$#" -ne 3 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
 store_dir="$(cat .capybara_store_location)"
+snapshot_old="$2"
+snapshot_new="$3"
 
-gather_metadata
-load_latest
+if [ "$snapshot_new" -le "$snapshot_old" ]
+then
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
+    exit 1
+fi
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
+cd "$store_dir"/snapshot
+if [ ! -f "$snapshot_old" ]
+then
+    printf '%s: Error: snapshot does not exist: %s\n' "$0" "$snapshot_old" 1>&2
+    exit 1
+fi
+
+if [ ! -f "$snapshot_new" ]
+then
+    printf '%s: Error: snapshot does not exist: %s\n' "$0" "$snapshot_new" 1>&2
+    exit 1
+fi
+
+sqlite3 ':memory:' <<EOF
 $dot_settings
+
+CREATE TABLE snapshot_old
+(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
+hash TEXT NOT NULL CHECK (Length(hash) = 128)
+);
+
+CREATE TABLE snapshot_new
+(filename TEXT NOT NULL CHECK (filename <> '' AND filename NOT LIKE '%|%'
+    AND filename NOT LIKE '%' || x'0A' || '%') UNIQUE PRIMARY KEY,
+hash TEXT NOT NULL CHECK (Length(hash) = 128)
+);
+
+.import $snapshot_old snapshot_old
+.import $snapshot_new snapshot_new
 
 SELECT
 'New: ' || a.filename
-FROM c_stage AS a
+FROM snapshot_new AS a
 WHERE
-a.filename NOT IN (SELECT b.filename FROM c_latest AS b);
+a.filename NOT IN (SELECT b.filename FROM snapshot_old AS b);
 
 SELECT
 'Removed: ' || a.filename
-FROM c_latest AS a
+FROM snapshot_old AS a
 WHERE
-a.filename NOT IN (SELECT b.filename FROM c_stage AS b);
+a.filename NOT IN (SELECT b.filename FROM snapshot_new AS b);
 
 SELECT
 'Modified: ' || a.filename
-FROM c_stage AS a
-INNER JOIN c_latest AS b
+FROM snapshot_new AS a
+INNER JOIN snapshot_old AS b
 ON a.filename = b.filename
-AND (a.file_size <> b.file_size OR a.modified_time <> b.modified_time);
+AND (a.hash <> b.hash);
 
 .quit
 EOF
@@ -310,127 +185,71 @@ then
 
 if [ "$#" -ne 1 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
+    exit 1
+fi
+
+if [ ! -f .capybara_store_location ]
+then
+    printf '%s: Error: Not in a capybara search directory\n' "$0" 1>&2
     exit 1
 fi
 
 store_dir="$(cat .capybara_store_location)"
 
 snapshot_time="$(date '+%s')"
+snapshot_path="$store_dir"/snapshot/"$snapshot_time"
 
-tmp_to_hash="$(mktemp)"
-tmp_hash_result="$(mktemp)"
-tmp_to_copy="$(mktemp)"
+if [ -f "$snapshot_path" ]
+then
+    printf '%s: Error: snapshot already exists: %s\n' "$0" "$snapshot_time" 1>&2
+    exit 1
+fi
 
-gather_metadata
-load_latest
+file_list="$(mktemp)"
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
+find . -type f -print0 > "$file_list"
 
-.echo off
-.changes off
-.output $tmp_to_hash
+if grep -E '\|' "$file_list"
+then
+    printf "%s: Error: Filename contains a pipe char\n" "$0" 1>&2
+    rm "$file_list"
+    exit 1
+fi
 
-/* Files to hash */
-SELECT
-a.filename
-FROM c_stage AS a
-WHERE
-(a.filename, a.file_size, a.modified_time)
-NOT IN
-(SELECT b.filename, b.file_size, b.modified_time FROM c_latest AS b);
+if < "$file_list" tr '\n' '|' | grep -E '\|'
+then
+    printf "%s: Error: Filename contains a newline char\n" "$0" 1>&2
+    "$file_list"
+    exit 1
+fi
 
-.output
+rm -rf "$store_dir"/tmp
+tmp_dir="$store_dir"/tmp
+mkdir "$tmp_dir"
+export tmp_dir
 
-.quit
-EOF
+< "$file_list" xargs -0 -n 5000 -P 4 sh -c 'sha512sum "$@" >> "$tmp_dir"/"$$".tmp' sh
 
-
-hash_files "$tmp_to_hash" "$tmp_hash_result"
-
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-DELETE FROM c_hash_result;
-.import $tmp_hash_result c_hash_result
-
-DELETE FROM c_to_copy;
-
-INSERT INTO c_to_copy
-(filename,
-hash)
-SELECT
-Min(a.filename),
-a.hash
-FROM c_hash_result AS a
-WHERE
-a.hash NOT IN (SELECT b.hash FROM c_data AS b)
-GROUP BY a.hash;
-
-.echo off
-.changes off
-.output $tmp_to_copy
-
-SELECT
-filename,
-hash
-FROM c_to_copy;
-
-.output
-
-.quit
-EOF
-
+hash_list="$(mktemp)"
+find "$tmp_dir" -type f -exec sed -E 's_^([0-9a-f]{128})  \./(.*)$_\2|\1_' '{}' \; > "$hash_list"
 
 while IFS='|' read -r filename hash
 do
     hash_subdir=$(printf '%s' "$hash" | cut -c -2)
     target_dir="$store_dir"/data/"$hash_subdir"
     mkdir -p "$target_dir"
-    cp -i "$filename" "$target_dir"/"$hash"
-done < "$tmp_to_copy"
+    target_path="$target_dir"/"$hash"
+    if [ ! -f "$target_path" ]
+    then
+        cp "$filename" "$target_path"~
+        mv "$target_path"~ "$target_path"
+    fi
+done < "$hash_list"
 
-
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-BEGIN TRANSACTION;
-
-INSERT INTO c_snapshot (snapshot_time) VALUES ($snapshot_time);
-
-INSERT INTO c_data (hash) SELECT hash FROM c_to_copy;
-
-INSERT INTO c_file
-(
-snapshot_time,
-filename,
-file_size,
-modified_time,
-perm,
-hash
-)
-SELECT
-$snapshot_time,
-a.filename,
-a.file_size,
-a.modified_time,
-a.perm,
-Coalesce(b.hash, c.hash) AS hash
-FROM c_stage AS a
-LEFT JOIN c_latest as b
-ON a.filename = b.filename
-AND a.file_size = b.file_size
-AND a.modified_time = b.modified_time
-LEFT JOIN c_hash_result as c
-ON a.filename = c.filename;
-
-END TRANSACTION;
-
-.quit
-EOF
-
-rm "$tmp_to_hash" "$tmp_hash_result" "$tmp_to_copy"
+cp "$hash_list" "$snapshot_path"~
+rm "$file_list" "$hash_list"
+mv "$snapshot_path"~ "$snapshot_path"
 
 
 ###############################################################################
@@ -439,54 +258,29 @@ then
 
 if [ "$#" -ne 1 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
 store_dir="$(cat .capybara_store_location)"
+cd "$store_dir"
 
-tmp_to_keep="$(mktemp)"
+hash_list="$(mktemp)"
+find snapshot -type f -exec cut -d '|' -f 2 '{}' \; | sort -u > "$hash_list"
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-BEGIN TRANSACTION;
-
-DELETE FROM c_data AS a
-WHERE
-a.hash NOT IN
-(SELECT b.hash FROM c_file AS b GROUP BY b.hash);
-
-DELETE FROM c_file AS a
-WHERE
-a.hash NOT IN
-(SELECT b.hash FROM c_data AS b);
-
-END TRANSACTION;
-
-.echo off
-.changes off
-.output $tmp_to_keep
-SELECT hash FROM c_data;
-.output
-
-.quit
-EOF
-
+rm -rf tmp data2
+mkdir data2
 
 while IFS='|' read -r hash
 do
     hash_subdir=$(printf '%s' "$hash" | cut -c -2)
-    new_dir="$store_dir"/data2/"$hash_subdir"
-    mkdir -p "$new_dir"
-    ln "$store_dir"/data/"$hash_subdir"/"$hash" "$new_dir"/"$hash"
-done < "$tmp_to_keep"
+    target_dir=data2/"$hash_subdir"
+    mkdir -p "$target_dir"
+    ln data/"$hash_subdir"/"$hash" "$target_dir"/"$hash"
+done < "$hash_list"
 
-
-rm -rf "$store_dir"/data
-mv "$store_dir"/data2 "$store_dir"/data
-
-rm "$tmp_to_keep"
+rm -rf data "$hash_list"
+mv data2 data
 
 
 ###############################################################################
@@ -495,33 +289,16 @@ then
 
 if [ "$#" -ne 1 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
 store_dir="$(cat .capybara_store_location)"
 
-tmp_hash_to_check="$(mktemp)"
+cd "$store_dir/data"
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-.echo off
-.changes off
-.output $tmp_hash_to_check
-SELECT
-'SHA512 (' || Substr(hash, 1, 2) || '/' || hash || ') = ' || hash
-FROM c_data;
-.output
-
-.quit
-EOF
-
-cd "$store_dir"/data
-
-sha512sum -c "$tmp_hash_to_check"
-
-rm "$tmp_hash_to_check"
+find . -type f ! -name '*~' | sed -E 's_^(.*)/([0-9a-f]{128})$_\2  \1/\2_' \
+    | sha512sum -c
 
 
 ###############################################################################
@@ -530,24 +307,45 @@ then
 
 if [ "$#" -ne 1 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
 store_dir="$(cat .capybara_store_location)"
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
+ls -lhat "$store_dir"/snapshot
 
-SELECT
-snapshot_time,
-Datetime(snapshot_time, 'unixepoch', 'localtime')
-FROM c_snapshot
-ORDER BY
-snapshot_time DESC;
+find "$store_dir"/snapshot -type f ! -name '*~' -exec sh -c '
+set -x
+set -e
+set -u
+t=$(basename "$1")
+d=$(date -d @"$t" "+%Y-%m-%d %H:%M:%S")
+printf "%s|%s\n" "$t" "$d"
+' sh '{}' \; | sort -r -t '|' -n -k 1,1
 
-.quit
-EOF
+
+###############################################################################
+elif [ "$1" = clean_perms ]
+then
+
+if [ "$#" -ne 1 ]
+then
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
+    exit 1
+fi
+
+store_dir="$(cat .capybara_store_location)"
+
+find "$store_dir"/data -type f -exec sh -c \
+'set -x
+set -e
+set -u
+fn="$1"
+if file "$fn" | grep -E executable
+then chmod 700 "$fn"
+else chmod 600 "$fn"
+fi' sh '{}' \;
 
 
 ###############################################################################
@@ -556,65 +354,36 @@ then
 
 if [ "$#" -ne 2 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
-snapshot="$2"
+snapshot_time="$2"
 
 if [ -e .capybara_store_location ]
 then
 store_dir="$(cat .capybara_store_location)"
-elif [ -e .capybara.db ]
+elif [ -e .capybara_store ]
 then
 store_dir='.'
+else
+    printf '%s: Error: Not in a capybara search or store directory\n' "$0" 1>&2
+    exit 1
 fi
 
-tmp_checkout="$(mktemp)"
+if [ ! -f "$store_dir"/snapshot/"$snapshot_time" ]
+then
+    printf '%s: Error: snapshot does not exist: %s\n' "$0" "$snapshot_time" 1>&2
+    exit 1
+fi
 
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-.echo off
-.changes off
-.output $tmp_checkout
-
-SELECT
-filename,
-modified_time,
-perm,
-hash
-FROM c_file
-WHERE
-snapshot_time = $snapshot;
-
-.output
-
-.quit
-EOF
-
-rm -rf "$store_dir"/checkout
-
-
-while IFS='|' read -r filename modified_time perm hash
+while IFS='|' read -r filename hash
 do
     fn_dir=$(dirname "$filename")
     mkdir -p "$store_dir"/checkout/"$fn_dir"
-    target_path="$store_dir"/checkout/"$filename"
     hash_subdir=$(printf '%s' "$hash" | cut -c -2)
-    ln "$store_dir"/data/"$hash_subdir"/"$hash" "$target_path"
-    if [ "$os" = Linux ]
-    then
-        touch -d @"$modified_time" "$target_path"
-    else
-        dttm=$(TZ=UTC date -r "$modified_time" '+%Y-%m-%dT%H:%M:%S')
-        TZ=UTC touch -d "$dttm" "$target_path"
-    fi
-    chmod "$perm" "$target_path"
-done < "$tmp_checkout"
-
-
-rm "$tmp_checkout"
+    ln "$store_dir"/data/"$hash_subdir"/"$hash" "$store_dir"/checkout/"$filename"
+done < "$store_dir"/snapshot/"$snapshot_time"
 
 
 ###############################################################################
@@ -623,7 +392,7 @@ then
 
 if [ "$#" -ne 3 ]
 then
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
 
@@ -634,109 +403,32 @@ store_dir="$(cat .capybara_store_location)"
 
 if [ ! -d "$external_media_dir" ]
 then
-    printf 'Error: capybara: Could not find external_media_dir: %s\n' \
-        "$external_media_dir" 1>&2
+    printf '%s: Error: capybara: Could not find external_media_dir: %s\n' \
+        "$0" "$external_media_dir" 1>&2
     exit 1
 fi
-
-tmp_status="$(mktemp)"
-
-capybara status > "$tmp_status"
-
-if [ -s "$tmp_status" ]
-then
-    printf 'Error: capybara: Files have changed since last snapshot:\n' 1>&2
-    cat "$tmp_status" 1>&2
-    rm "$tmp_status"
-    exit 1
-fi
-
-tmp_fn="$(mktemp)"
-tmp_fn_check="$(mktemp)"
-
-find "$external_media_dir" -type f ! -empty -print0 > "$tmp_fn"
-
-< "$tmp_fn" tr -d '|\n' > "$tmp_fn_check"
-
-if ! cmp "$tmp_fn" "$tmp_fn_check"
-then
-    printf 'Error: capybara: Newline or pipe character in filename\n' 1>&2
-    rm "$tmp_status" "$tmp_fn" "$tmp_fn_check"
-    exit 1
-fi
-
-tmp_hash_result="$(mktemp)"
-tmp_to_hard_link="$(mktemp)"
-
-
-hash_files "$tmp_fn" "$tmp_hash_result"
-
-load_latest
-
-
-sqlite3 "$store_dir"/.capybara.db <<EOF
-$dot_settings
-
-DELETE FROM c_hash_result;
-.import $tmp_hash_result c_hash_result
-
-.echo off
-.changes off
-.output $tmp_to_hard_link
-
-SELECT
-Min(a.filename),
-a.hash
-FROM c_hash_result AS a
-WHERE a.hash NOT IN
-    (SELECT b.hash FROM c_latest AS b
-    WHERE b.filename LIKE '$capybara_source_subdir/%'
-    GROUP BY b.hash)
-GROUP BY a.hash;
-
-.output
-
-.quit
-EOF
-
-tmp_media_dir=$(mktemp -d XXXXXXXXXX)
-
-while IFS='|' read -r filename hash
-do
-    # To preserve the file extension
-    fn_base=$(basename "$filename")
-    ln "$filename" "$tmp_media_dir"/"$hash"_"$fn_base"
-done < "$tmp_to_hard_link"
-
-rm -rf "$external_media_dir"
 
 # Rename and move files with exif date
 exiftool -r '-FileName<CreateDate' \
--d "$capybara_source_subdir"'/%Y/%m/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
--ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$tmp_media_dir"
+    -d "$capybara_source_subdir"'/%Y/%m/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
+    -ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$external_media_dir"
 
 # Rename and move files without exif date
 exiftool -r '-FileName<FileModifyDate' \
--d "$capybara_source_subdir"'/noexifdate/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
--ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$tmp_media_dir"
+    -d "$capybara_source_subdir"'/noexifdate/%Y_%m_%d_%H_%M_%S%%-c.%%ue' \
+    -ext heic -ext jpg -ext jpeg -ext mov -ext mp4 "$external_media_dir"
 
 # Delete junk and PNG files
-find "$tmp_media_dir" \
+find "$external_media_dir" \
 \( -name 'desktop.ini' -o -name '.nomedia' -o -iname '*.AAE' \
 -o -iname '*.PNG' \) \
 -type f -delete
 
 # Delete empty directories
-find "$tmp_media_dir" -type d -empty -delete
+find "$external_media_dir" -type d -empty -delete
 
-if [ -d "$tmp_media_dir" ]
-then
-    printf 'capybara: Unorganised files remain in directory: %s\n' \
-        "$tmp_media_dir"
-fi
-
-rm "$tmp_status" "$tmp_fn" "$tmp_fn_check" "$tmp_hash_result" \
-    "$tmp_to_hard_link"
+# Remove duplicates
+jdupes --recurse --order=name --delete --noprompt "$capybara_source_subdir"
 
 
 ###############################################################################
@@ -747,6 +439,6 @@ then
 
 ###############################################################################
 else
-    printf 'Error: %s' "$usage" 1>&2
+    printf '%s: Error: %s' "$0" "$usage" 1>&2
     exit 1
 fi
